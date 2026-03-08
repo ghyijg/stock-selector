@@ -1,0 +1,17 @@
+{
+  "rewrites": [
+    { "source": "/api/em/(.*)", "destination": "https://push2.eastmoney.com/$1" },
+    { "source": "/api/emhis/(.*)", "destination": "https://push2his.eastmoney.com/$1" },
+    { "source": "/api/emdc/(.*)", "destination": "https://datacenter-web.eastmoney.com/$1" },
+    { "source": "/api/sina/(.*)", "destination": "https://money.finance.sina.com.cn/$1" }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "X-Frame-Options", "value": "DENY" }
+      ]
+    }
+  ]
+}
