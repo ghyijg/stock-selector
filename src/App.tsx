@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useMemo } from 'react'
+import { useState, useCallback, useEffect, useMemo } from 'react'
 import { getStockList, fetchStockData, getStockSector } from './api'
 import { runAllStrategies, matchStrategy4 } from './strategies'
 import type { StrategyMatch, StrategyId } from './types'
