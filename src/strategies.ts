@@ -108,6 +108,41 @@ export function matchStrategy4(stock: StockWithData): StrategyMatch | null {
   }
 }
 
+/** 策略5：周K量比85%-110%，且两周均收涨；最近一周周涨幅0%-2% */
+export function matchStrategy5(stock: StockWithData): StrategyMatch | null {
+  const weekly = stock.weekly
+  if (weekly.length < 2) return null
+
+  const sorted = [...weekly].sort((a, b) => a.date.localeCompare(b.date))
+  const cur = sorted[sorted.length - 1]
+  const prev = sorted[sorted.length - 2]
+
+  if (prev.volume <= 0 || cur.volume <= 0) return null
+  const volRatio = cur.volume / prev.volume
+  const volInRange = volRatio >= 0.85 && volRatio <= 1.1
+
+  const curUp = cur.close > cur.open
+  const prevUp = prev.close > prev.open
+
+  if (!prev.close || prev.close <= 0) return null
+  const changePct = (cur.close - prev.close) / prev.close
+  const gainInRange = changePct >= 0 && changePct <= 0.02
+
+  if (!volInRange || !curUp || !prevUp || !gainInRange) return null
+
+  return {
+    stock,
+    strategyId: 5,
+    reason: `周量比${(volRatio * 100).toFixed(0)}%（85%~110%），两周收涨，近一周周涨幅${(changePct * 100).toFixed(2)}%（0%~2%）`,
+    metrics: {
+      '周量比': `${(volRatio * 100).toFixed(1)}%`,
+      '本周': curUp ? '涨' : '跌',
+      '上周': prevUp ? '涨' : '跌',
+      '周涨幅': `${(changePct * 100).toFixed(2)}%`,
+    },
+  }
+}
+
 export function runAllStrategies(stock: StockWithData): StrategyMatch[] {
   const out: StrategyMatch[] = []
   const r1 = matchStrategy1(stock)
@@ -118,5 +153,7 @@ export function runAllStrategies(stock: StockWithData): StrategyMatch[] {
   if (r3) out.push(r3)
   const r4 = matchStrategy4(stock)
   if (r4) out.push(r4)
+  const r5 = matchStrategy5(stock)
+  if (r5) out.push(r5)
   return out
 }

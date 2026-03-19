@@ -18,40 +18,133 @@ function secidFromCode(code: string): string {
   return `0.${c}`
 }
 
-const LIST_PAGE_SIZE = 5000
+// 东方财富该接口在部分网络/代理环境下会对 `pz` 做上限限制，导致“即使请求 5000，也只返回约100条”
+// 因此这里按 100 分页，并用 total/去重/无新增停止来避免死循环与提前结束。
+const LIST_PAGE_SIZE = 100
 
 /** 获取A股列表（沪深），分页拉取直至取完全部 */
 export async function fetchStockList(): Promise<Array<{ code: string; name: string; secid: string }>> {
   const list: Array<{ code: string; name: string; secid: string }> = []
-  try {
+  const seen = new Set<string>()
+
+  const CACHE_KEY = 'stockListCache_v1'
+  const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000 // 24h
+
+  function readCache(): Array<{ code: string; name: string; secid: string }> | null {
+    try {
+      if (typeof window === 'undefined') return null
+      const raw = window.localStorage.getItem(CACHE_KEY)
+      if (!raw) return null
+      const parsed = JSON.parse(raw) as { ts?: number; list?: Array<{ code: string; name: string; secid: string }> }
+      const ts = typeof parsed.ts === 'number' ? parsed.ts : 0
+      if (!parsed.list || !Array.isArray(parsed.list)) return null
+      if (ts > 0 && Date.now() - ts > CACHE_MAX_AGE_MS) return null
+      return parsed.list
+    } catch {
+      return null
+    }
+  }
+
+  function writeCache(next: Array<{ code: string; name: string; secid: string }>) {
+    try {
+      if (typeof window === 'undefined') return
+      window.localStorage.setItem(CACHE_KEY, JSON.stringify({ ts: Date.now(), list: next }))
+    } catch {
+      // ignore
+    }
+  }
+
+  async function fetchJsonWithRetry(url: string, retryCount = 3): Promise<any> {
+    let lastErr: unknown = null
+    for (let i = 0; i < retryCount; i++) {
+      try {
+        const res = await fetch(url, { headers: { 'User-Agent': UA, Referer: REFERER } })
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        return await res.json()
+      } catch (e) {
+        lastErr = e
+        // 指数退避，避免触发更强的限流
+        if (i < retryCount - 1) {
+          const ms = 400 * (i + 1)
+          await new Promise((r) => setTimeout(r, ms))
+        }
+      }
+    }
+    throw lastErr
+  }
+
+  // 分市场抓取，避免 fs 合并请求在部分环境下被接口截断（常见现象：只返回约 800/1100 只）
+  async function fetchByFs(fs: string) {
     let pn = 1
+    const maxPages = 200
     let hasMore = true
-    while (hasMore) {
+    while (hasMore && pn <= maxPages) {
       const url = BASE.list + '/api/qt/clist/get?' + new URLSearchParams({
-        fs: 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23',
+        fs,
         fields: 'f12,f14,f13',
         pn: String(pn),
         pz: String(LIST_PAGE_SIZE),
       })
-      const res = await fetch(url, { headers: { 'User-Agent': UA, Referer: REFERER } })
-      const data = await res.json()
+      let data: any
+      try {
+        data = await fetchJsonWithRetry(url, 3)
+      } catch {
+        // 单个分段抓取失败就停止该分段，继续尝试其他分段
+        break
+      }
       const raw = data?.data?.diff
       const items = Array.isArray(raw) ? raw : (raw && typeof raw === 'object' ? Object.values(raw) : [])
+      const beforeSize = list.length
       for (const it of items) {
         const code = String((it as { f12?: string }).f12 ?? '')
         if (!code) continue
+        const secid = `${(it as { f13?: number }).f13 ?? 0}.${code}`
+        const key = `${code}|${secid}`
+        if (seen.has(key)) continue
+        seen.add(key)
         list.push({
           code,
           name: String((it as { f14?: string; f12?: string }).f14 ?? (it as { f12?: string }).f12 ?? ''),
-          secid: `${(it as { f13?: number }).f13 ?? 0}.${code}`,
+          secid,
         })
       }
+
+      // 本页没有新增数据：说明翻页无效或已经到尾页
+      if (list.length === beforeSize) break
       hasMore = items.length >= LIST_PAGE_SIZE
       pn += 1
+
+      // 轻微节流，降低触发上游断连/限流概率
+      await new Promise((r) => setTimeout(r, 120))
+    }
+  }
+
+  try {
+    const segments = [
+      'm:0+t:6',   // 深主板
+      'm:0+t:80',  // 创业板
+      'm:0+t:81',  // 北交所
+      'm:1+t:2',   // 沪主板
+      'm:1+t:23',  // 科创板
+    ]
+    for (const fs of segments) {
+      await fetchByFs(fs)
+      // 达到你期望的规模就提前停止，减少无意义请求
+      if (list.length >= 5000) break
     }
   } catch {
     // 接口异常时返回已拉取的列表
   }
+
+  // 远端拉取失败但本地缓存可用：直接回退缓存，保证页面可继续筛选。
+  if (list.length === 0) {
+    const cached = readCache()
+    if (cached && cached.length > 0) return cached
+  }
+
+  // 只有在成功拉到一些结果时才写缓存，避免缓存空数据。
+  if (list.length > 0) writeCache(list)
+
   return list
 }
 
@@ -63,6 +156,24 @@ interface RawKLine {
   f55: number
   f56: number
   f57?: number
+}
+
+/** 获取实时最新价（东方财富快照），失败返回 null */
+export async function fetchRealtimePrice(secid: string): Promise<number | null> {
+  try {
+    const url = `${BASE.list}/api/qt/stock/get?secid=${encodeURIComponent(secid)}&fields=f43`
+    const res = await fetch(url, { headers: { 'User-Agent': UA, Referer: REFERER } })
+    if (!res.ok) return null
+    const data = await res.json()
+    const raw = Number(data?.data?.f43)
+    if (!Number.isFinite(raw) || raw <= 0) return null
+    // 东财快照 f43 通常放大 100 倍，统一还原为价格
+    const price = raw / 100
+    if (!Number.isFinite(price) || price <= 0) return null
+    return price
+  } catch {
+    return null
+  }
 }
 
 /** 获取K线：klt 101=日 102=周 */

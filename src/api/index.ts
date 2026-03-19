@@ -1,6 +1,6 @@
 import type { KLineItem, StockWithData } from '../types'
-import { fetchStockList, fetchKLine, fetchHolderChange, fetchStockSector, secidFromCode } from './eastmoney'
-import { fetchDailyKLineSina, toRawKLine } from './sina'
+import { fetchKLine, fetchHolderChange, fetchStockSector, fetchRealtimePrice, secidFromCode } from './eastmoney'
+import { fetchDailyKLineSina, fetchStockListSina, toRawKLine } from './sina'
 
 function parseKlines(raw: Array<{ f51: string; f52: number; f53: number; f54: number; f55: number; f56: number }>): KLineItem[] {
   return raw.map((r) => ({
@@ -85,7 +85,8 @@ export async function fetchStockData(
     } catch { /* 散户数量数据失败仅影响策略1、3 */ }
 
     const latest = daily[daily.length - 1]
-    const price = latest.close
+    const realtimePrice = await fetchRealtimePrice(secid)
+    const price = realtimePrice != null ? realtimePrice : latest.close
     const ma5 = daily.length >= 5
       ? daily.slice(-5).reduce((s, k) => s + k.close, 0) / 5
       : null
@@ -112,7 +113,71 @@ export async function fetchStockData(
 
 /** 获取股票列表（用于选股池） */
 export async function getStockList(): Promise<Array<{ code: string; name: string; secid: string }>> {
-  return fetchStockList()
+  const BEST_CACHE_KEY = 'stockListBest_v1'
+
+  const readBestCache = (): Array<{ code: string; name: string; secid: string }> => {
+    try {
+      if (typeof window === 'undefined') return []
+      const raw = window.localStorage.getItem(BEST_CACHE_KEY)
+      if (!raw) return []
+      const parsed = JSON.parse(raw) as { list?: Array<{ code: string; name: string; secid: string }> }
+      return Array.isArray(parsed.list) ? parsed.list : []
+    } catch {
+      return []
+    }
+  }
+
+  const writeBestCache = (list: Array<{ code: string; name: string; secid: string }>) => {
+    try {
+      if (typeof window === 'undefined') return
+      window.localStorage.setItem(BEST_CACHE_KEY, JSON.stringify({ ts: Date.now(), list }))
+    } catch {
+      // ignore
+    }
+  }
+
+  const withTimeout = async <T,>(p: Promise<T>, ms: number): Promise<T> => {
+    return await new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout_${ms}ms`)), ms)
+      p.then(
+        (v) => {
+          clearTimeout(timer)
+          resolve(v)
+        },
+        (e) => {
+          clearTimeout(timer)
+          reject(e)
+        }
+      )
+    })
+  }
+
+  // 先拿新浪全A：当前网络下最稳定，避免被东财接口 hang 住
+  let sina: Array<{ code: string; name: string; secid: string }> = []
+  try {
+    // 全市场分页较多，30s 容易被截断成 2k~3k；这里放宽到 3 分钟保证拉全量
+    sina = await withTimeout(fetchStockListSina(), 180000)
+  } catch {
+    sina = []
+  }
+
+  // 若新浪已达全市场规模，直接返回，不再调用东财列表接口
+  if (sina.length >= 5000) {
+    const bestCachedNow = readBestCache()
+    if (sina.length > bestCachedNow.length) writeBestCache(sina)
+    return sina
+  }
+
+  const bestCached = readBestCache()
+  if (sina.length === 0) return bestCached
+  const current = sina
+
+  // 防倒退：若当前结果比历史最大池更小，直接回退到历史最大池
+  if (bestCached.length >= 5000 && current.length < bestCached.length) return bestCached
+
+  // 持续更新“历史最大池”
+  if (current.length > bestCached.length) writeBestCache(current)
+  return current
 }
 
 /** 获取个股所属行业/板块 */

@@ -31,7 +31,7 @@ export interface StockWithData extends StockInfo {
 }
 
 /** 策略类型 */
-export type StrategyId = 1 | 2 | 3 | 4
+export type StrategyId = 1 | 2 | 3 | 4 | 5
 
 /** 单只股票的策略匹配结果 */
 export interface StrategyMatch {

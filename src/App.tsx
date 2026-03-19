@@ -10,6 +10,7 @@ const STRATEGY_NAMES: Record<StrategyId, string> = {
   2: '策略二：周K量能90%-120%，近两根周K均收涨',
   3: '策略三：5/10日线上方，缩量下跌(缩量45%以上)，散户数量减小',
   4: '策略四：放量上涨涨幅2%-5%，近两日红柱，量比85%-120%，散户数量±50以内',
+  5: '策略五：周K量比85%-110%且两周收涨，最近一周周涨幅0%-2%',
 }
 
 /** 已退市股票代码（如招商地产 000024），从结果中排除 */
@@ -42,6 +43,7 @@ export default function App() {
   const [results, setResults] = useState<StrategyMatch[]>([])
   const [filterStrategy, setFilterStrategy] = useState<StrategyId | 'all'>('all')
   const [error, setError] = useState<string | null>(null)
+  const [warning, setWarning] = useState<string | null>(null)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [diagnosticLoading, setDiagnosticLoading] = useState(false)
   const [diagnosticResult, setDiagnosticResult] = useState<string | null>(null)
@@ -53,14 +55,13 @@ export default function App() {
     ? results
     : results.filter((r) => r.strategyId === filterStrategy)
 
-  /** 排除已退市 + 查不到板块的股票后的展示列表 */
+  /** 排除已退市股票后的展示列表（板块为空也保留，避免误过滤命中） */
   const displayFiltered = useMemo(() => {
     return filtered.filter((m) => {
       if (DELISTED_CODES.has(m.stock.code)) return false
-      const sector = sectorMap[m.stock.code]
-      return !!sector && sector.trim() !== ''
+      return true
     })
-  }, [filtered, sectorMap])
+  }, [filtered])
 
   const uniqueStocks = useMemo(() => {
     const m = new Map<string, (typeof results)[0]['stock']>()
@@ -79,12 +80,33 @@ export default function App() {
     return Array.from(m.values())
   }, [displayFiltered])
 
+  const filterDataBasis = useMemo(() => {
+    if (displayUniqueStocks.length === 0) return null
+    const latestDailyDates = displayUniqueStocks
+      .map((s) => (s.daily?.length ? s.daily[s.daily.length - 1].date : ''))
+      .filter(Boolean)
+      .sort()
+    const latestWeeklyDates = displayUniqueStocks
+      .map((s) => (s.weekly?.length ? s.weekly[s.weekly.length - 1].date : ''))
+      .filter(Boolean)
+      .sort()
+    const dailyText = latestDailyDates.length
+      ? `${latestDailyDates[0]} ~ ${latestDailyDates[latestDailyDates.length - 1]}`
+      : '-'
+    const weeklyText = latestWeeklyDates.length
+      ? `${latestWeeklyDates[0]} ~ ${latestWeeklyDates[latestWeeklyDates.length - 1]}`
+      : '-'
+    return { dailyText, weeklyText }
+  }, [displayUniqueStocks])
+
   const uniqueCodeKey = useMemo(
     () => [...new Set(filtered.map((r) => r.stock.code))].sort().join(','),
     [filtered]
   )
 
   useEffect(() => {
+    // 扫描进行中不拉板块，避免在弱网络下把代理请求打爆
+    if (loading) return
     if (uniqueStocks.length === 0) {
       setSectorMap({})
       return
@@ -92,16 +114,20 @@ export default function App() {
     let cancelled = false
     const next: Record<string, string> = {}
     const run = async () => {
-      for (const s of uniqueStocks) {
+      // 仅拉取前 300 只用于展示，避免无上限请求导致 socket hang up 风暴
+      const pending = uniqueStocks.slice(0, 300).filter((s) => !sectorMap[s.code])
+      for (const s of pending) {
         if (cancelled) return
         const sector = await getStockSector(s.secid)
         if (sector) next[s.code] = sector
       }
-      if (!cancelled) setSectorMap((prev) => ({ ...prev, ...next }))
+      if (!cancelled && Object.keys(next).length > 0) {
+        setSectorMap((prev) => ({ ...prev, ...next }))
+      }
     }
     run()
     return () => { cancelled = true }
-  }, [uniqueCodeKey])
+  }, [uniqueCodeKey, loading, sectorMap, uniqueStocks])
 
   useEffect(() => {
     if (displayUniqueStocks.length === 0 || (returnStartDate && returnEndDate)) return
@@ -190,6 +216,7 @@ export default function App() {
   const runScan = useCallback(async () => {
     setLoading(true)
     setError(null)
+    setWarning(null)
     setResults([])
     setProgress({ current: 0, total: 0 })
     try {
@@ -198,22 +225,37 @@ export default function App() {
         setError('未获取到股票列表，请用 npm run dev 启动本地代理后重试，或点击「数据诊断」查看接口是否正常')
         return
       }
+      if (scanAll && list.length < 5000) {
+        setWarning(`全A股列表数量异常：仅获取到 ${list.length} 只（要求5000+）。将继续使用当前列表进行扫描（命中可能偏少）。`)
+      }
       const total = scanAll ? list.length : Math.min(poolSize, list.length)
       const slice = list.slice(0, total)
       setProgress({ current: 0, total: slice.length })
       const matches: StrategyMatch[] = []
-      for (let i = 0; i < slice.length; i++) {
-        const item = slice[i]
-        const data = await fetchStockData(item.code, item.name, item.secid)
-        if (data) {
-          const m = runAllStrategies(data)
-          matches.push(...m)
-        }
-        if ((i + 1) % 20 === 0) {
-          setResults([...matches])
-          setProgress({ current: i + 1, total: slice.length })
+      let done = 0
+      let cursor = 0
+      const workerCount = Math.min(scanAll ? 12 : 8, Math.max(1, slice.length))
+
+      const worker = async () => {
+        while (true) {
+          const idx = cursor
+          cursor += 1
+          if (idx >= slice.length) return
+          const item = slice[idx]
+          const data = await fetchStockData(item.code, item.name, item.secid)
+          if (data) {
+            const m = runAllStrategies(data)
+            matches.push(...m)
+          }
+          done += 1
+          if (done % 25 === 0 || done === slice.length) {
+            setResults([...matches])
+            setProgress({ current: done, total: slice.length })
+          }
         }
       }
+
+      await Promise.all(Array.from({ length: workerCount }, () => worker()))
       setResults(matches)
       setProgress({ current: slice.length, total: slice.length })
       if (matches.length === 0 && slice.length > 0) {
@@ -225,6 +267,52 @@ export default function App() {
       setLoading(false)
     }
   }, [scanAll, poolSize])
+
+  const exportMatchesCsv = useCallback((rows: StrategyMatch[], fileLabel: string) => {
+    if (!rows.length) return
+    const esc = (v: string | number | null | undefined) => {
+      const s = String(v ?? '')
+      return `"${s.replace(/"/g, '""')}"`
+    }
+    const header = [
+      '策略',
+      '代码',
+      '名称',
+      '板块',
+      '现价',
+      '5日线',
+      '10日线',
+      '散户数量变化',
+      '匹配说明',
+    ]
+    const lines = [header.map(esc).join(',')]
+    for (const m of rows) {
+      lines.push([
+        `策略${m.strategyId}`,
+        m.stock.code,
+        m.stock.name,
+        sectorMap[m.stock.code] ?? '-',
+        m.stock.price.toFixed(2),
+        m.stock.ma5 != null ? m.stock.ma5.toFixed(2) : '-',
+        m.stock.ma10 != null ? m.stock.ma10.toFixed(2) : '-',
+        m.stock.holderChange != null
+          ? `${m.stock.holderChange > 0 ? '+' : ''}${m.stock.holderChange}`
+          : '-',
+        m.reason,
+      ].map(esc).join(','))
+    }
+    const csv = '\uFEFF' + lines.join('\n')
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+    a.href = url
+    a.download = `${fileLabel}-${ts}.csv`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  }, [sectorMap])
 
   return (
     <>
@@ -278,6 +366,7 @@ export default function App() {
       </section>
 
       {error && <div className="error">{error}</div>}
+      {warning && !loading && <div className="warning">{warning}</div>}
 
       <section className="diagnostic card">
         <button type="button" className="btn-diagnostic" onClick={runDiagnostic} disabled={diagnosticLoading}>
@@ -296,7 +385,7 @@ export default function App() {
         >
           全部
         </button>
-        {( [1, 2, 3, 4] as StrategyId[] ).map((id) => (
+        {( [1, 2, 3, 4, 5] as StrategyId[] ).map((id) => (
           <button
             key={id}
             className={filterStrategy === id ? 'active' : ''}
@@ -322,13 +411,39 @@ export default function App() {
 
       <section className="results card">
         <div className="strategy-desc">
-          <span className="result-summary">共 {displayFiltered.length} 条命中（已排除退市及无板块）</span>
+          <span className="result-summary">共 {displayFiltered.length} 条命中（已排除退市）</span>
           <span className="result-desc">
             {filterStrategy === 'all'
               ? '· 当前显示所有策略'
               : `· ${STRATEGY_NAMES[filterStrategy as StrategyId]}`}
           </span>
           <span className="data-source">（散户数量=东方财富股东户数，与问财一致）</span>
+          {filterDataBasis && (
+            <span className="data-basis">
+              筛选时间基准：日K最新 {filterDataBasis.dailyText}；周K最新 {filterDataBasis.weeklyText}
+            </span>
+          )}
+          <div className="export-actions">
+            <button
+              type="button"
+              className="btn-export"
+              disabled={displayFiltered.length === 0}
+              onClick={() => exportMatchesCsv(
+                displayFiltered,
+                filterStrategy === 'all' ? '全部策略命中' : `策略${filterStrategy}命中`
+              )}
+            >
+              导出当前筛选
+            </button>
+            <button
+              type="button"
+              className="btn-export btn-export--secondary"
+              disabled={results.length === 0}
+              onClick={() => exportMatchesCsv(results, '全部命中原始结果')}
+            >
+              导出全部命中
+            </button>
+          </div>
         </div>
         {displayFiltered.length === 0 && !loading && (
           <p className="empty">暂无命中，请点击「开始筛选」或增大扫描池</p>
